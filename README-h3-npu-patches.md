@@ -14,5 +14,5 @@ Baseline: vllm-project/vllm-omni 0.28.0 (main snapshot, shipped wheel).
 | `scripts/` | run_config.sh (all serving configs: bf16/int8/mxfp8/mxfp4/pruned-*/turbo-merges), gen_sample.sh (generation client), offline LoRA merge scripts (lightx2v turbo 4-step into pruned/dense base, larryvrh v4 with analytic adaln fold dW=B@(A@basis.T), db=B@(A@mean)) |
 | `docs/REPORT.md` | full bring-up log: quantization comparison, turbo distillation speedups (4-step 43.4s / 8-step 87.6s e2e at 1344x768x5s), MFU analysis (~55-64% mixed), mosaic artifact investigation |
 
-## Known open issue
-Mosaic/checkerboard artifact on all pruned-model outputs (16-20px periodic, token-level decorrelation). Attention backend / RoPE kernel / weight loading / patchify all verified correct; root cause under active numerical bisection vs diffusers 0.40 reference.
+## RESOLVED: mosaic artifact
+Root cause: `MiniMaxH3Rope.inv_freq` was registered via `torch.empty` (uninitialized). Dense checkpoints ship `rope.inv_freq` in safetensors so the buffer got overwritten; pruned checkpoints (diffusers convention, non-persistent buffer) do not, leaving malloc garbage (~1e31) as rotary frequencies -> pseudo-random angle rotations -> total spatial decorrelation -> 16-20px checkerboard. Fixed by computing `inv_freq = theta^-(arange(0,32,2)/32)` at init. See docs/FIX_REPORT.md; verification sample: samples/fix_check.mp4 (clean golden-retriever frame).
