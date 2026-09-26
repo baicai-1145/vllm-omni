@@ -3,8 +3,9 @@
 ## 使命
 在单卡 Ascend 950PR (9579, 28 AIC, 128G HBM) 上跑 MiniMax-H3 剪枝模型的视频生成, 持续优化推理速度与 W4A4 MXFP4 画质。
 
-## 硬约束 (违反 = 死机/返工)
-- **容器内存 32G 硬限制, 占满直接死机** (已死过 2 次)。任何加载/合并脚本先算内存; 进程 RSS > 20G 立即停。
+## 最高优先级警告
+**容器内存只有 32G, 严禁占满 — 一旦占满整机死机重启, 所有进行中工作全部丢失 (已发生过 2 次)。**
+任何 Python 进程/加载/合并/物化脚本启动前必须估算峰值内存; 运行中 RSS 超 20G 立即中止优化。禁用一次性读全量权重的写法 (40G 权重哪怕流式合并也要分 shard 处理)。
 - bash 工具 timeout ≤ 60s。长任务 `setsid nohup ... &` 后台跑; **禁止 sleep 轮询等待**。
 - 杀 vllm 必须用 python os.kill (bash kill 无效):
   `python3 -c "import os,signal; [os.kill(int(p), signal.SIGKILL) for p in os.listdir('/proc') if p.isdigit() and open(f'/proc/{p}/comm').read().strip() in ('vllm','python') and int(p)!=310]"`
