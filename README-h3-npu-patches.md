@@ -16,3 +16,6 @@ Baseline: vllm-project/vllm-omni 0.28.0 (main snapshot, shipped wheel).
 
 ## RESOLVED: mosaic artifact
 Root cause: `MiniMaxH3Rope.inv_freq` was registered via `torch.empty` (uninitialized). Dense checkpoints ship `rope.inv_freq` in safetensors so the buffer got overwritten; pruned checkpoints (diffusers convention, non-persistent buffer) do not, leaving malloc garbage (~1e31) as rotary frequencies -> pseudo-random angle rotations -> total spatial decorrelation -> 16-20px checkerboard. Fixed by computing `inv_freq = theta^-(arange(0,32,2)/32)` at init. See docs/FIX_REPORT.md; verification sample: samples/fix_check.mp4 (clean golden-retriever frame).
+
+## New agent onboarding
+Start with `AGENTS.md` (hard constraints, baseline numbers, serving commands, TODOs) and `QUANT-NOTES.md` (W4A4 MXFP4 dualscale internals, mul_scale calibration plan, survey of community H3 W4A4 checkpoints). Full history in `docs/REPORT.md`.
