@@ -290,7 +290,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
-        return False
+        # H3: torch_npu ships a full inductor backend (torch_npu._inductor);
+        # verified working for bf16 elementwise+matmul on 950PR. Gate behind env
+        # so default stays eager unless explicitly requested.
+        import os
+
+        return os.environ.get("H3_ENABLE_INDUCTOR", "0") == "1"
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
