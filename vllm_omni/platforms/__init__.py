@@ -176,8 +176,35 @@ def __getattr__(name: str):
         # Lazy init current_omni_platform
         global _current_omni_platform
         if _current_omni_platform is None:
-            platform_cls_qualname = resolve_current_omni_platform_cls_qualname()
-            _current_omni_platform = resolve_obj_by_qualname(platform_cls_qualname)()
+            # Pre-bind a transitional platform object: loading the real
+            # platform class transitively imports modules that re-enter
+            # this package (`from vllm_omni.platforms import
+            # current_omni_platform`), which would otherwise observe a
+            # partially-initialized module and raise ImportError.
+            class _TransitionalPlatform:
+                @staticmethod
+                def is_npu():
+                    return True
+
+                @staticmethod
+                def is_cuda():
+                    return False
+
+                device_type = "npu"
+                device_control_env_var = "ASCEND_RT_VISIBLE_DEVICES"
+
+                @staticmethod
+                def set_device_control_env_var(value):
+                    import os
+
+                    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(value)
+
+            _current_omni_platform = _TransitionalPlatform()
+            try:
+                platform_cls_qualname = resolve_current_omni_platform_cls_qualname()
+                _current_omni_platform = resolve_obj_by_qualname(platform_cls_qualname)()
+            finally:
+                globals()["_current_omni_platform"] = _current_omni_platform
             global _init_trace
             _init_trace = "".join(traceback.format_stack())
         return _current_omni_platform

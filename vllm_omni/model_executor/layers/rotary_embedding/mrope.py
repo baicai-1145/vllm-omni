@@ -17,9 +17,20 @@ import torch
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
 
-from vllm_omni.platforms import current_omni_platform
+def _resolve_is_npu() -> bool:
+    try:
+        from vllm_omni.platforms import current_omni_platform
 
-if current_omni_platform.is_npu():
+        return current_omni_platform.is_npu()
+    except Exception:
+        # Import-cycle fallback (package __getattr__ not yet available):
+        # decide from torch_npu availability, semantically equivalent.
+        import importlib.util
+
+        return importlib.util.find_spec("torch_npu") is not None
+
+
+if _resolve_is_npu():
     from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding as _BaseMRotaryEmbedding
 else:
     from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding as _BaseMRotaryEmbedding

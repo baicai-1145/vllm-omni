@@ -99,7 +99,12 @@ class MiniMaxH3DiTArchConfig:
     adaln_out_features: int = 18 * 5376
     final_adaln_out_features: int = 2 * 5376
     rope_inv_freq_len: int = 16
+    rope_theta: float = 10000.0
     norm_eps: float = 1e-5
+    # Pruned-checkpoint AdaLN rank (0 = released dense layout). When > 0 the
+    # time embedder is an interpolated coordinate table and every AdaLN
+    # projection consumes rank-wide inputs with a separate folded bias.
+    adaln_rank: int = 0
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
 
@@ -276,11 +281,14 @@ class MiniMaxH3Rope(nn.Module):
     with 16 frequencies per axis (inv_freq = base^-(arange(0,32,2)/32)).
     """
 
-    def __init__(self, inv_freq_len: int) -> None:
+    def __init__(self, inv_freq_len: int, rope_theta: float = 10000.0) -> None:
         super().__init__()
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, 2 * inv_freq_len, 2, dtype=_FP32_DTYPE) / (2 * inv_freq_len))
+        )
         self.register_buffer(
             "inv_freq",
-            torch.empty(inv_freq_len, dtype=_FP32_DTYPE),
+            inv_freq,
             persistent=True,
         )
 
@@ -313,31 +321,60 @@ class MiniMaxH3TimeEmbedder(nn.Module):
     ) -> None:
         super().__init__()
         self.frequency_embedding_size = arch.timestep_input_dim
-        self.proj_in = ColumnParallelLinear(
-            arch.timestep_input_dim,
-            arch.time_embed_hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix=f"{prefix}.proj_in",
-        )
-        self.proj_out = RowParallelLinear(
-            arch.time_embed_hidden_size,
-            arch.time_embed_dim,
-            bias=True,
-            input_is_parallel=False,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix=f"{prefix}.proj_out",
-        )
+        import os as _os
+        self.is_pruned = _os.environ.get("H3_PRUNED_ADALN") == "1" or arch.adaln_rank > 0
+        if self.is_pruned:
+            # Coordinate-table mode: no MLP weights exist in the checkpoint.
+            self.proj_in = None
+            self.proj_out = None
+        else:
+            self.proj_in = ColumnParallelLinear(
+                arch.timestep_input_dim,
+                arch.time_embed_hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.proj_in",
+            )
+            self.proj_out = RowParallelLinear(
+                arch.time_embed_hidden_size,
+                arch.time_embed_dim,
+                bias=True,
+                input_is_parallel=False,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.proj_out",
+            )
+        # Pruned-checkpoint coordinate table (H3_PRUNED_ADALN=1): loaded by
+        # load_weights from ``time_embedder.table``. None keeps the released
+        # sinusoidal-MLP path intact.
+        self.coord_table: torch.Tensor | None = None
+        if arch.adaln_rank > 0:
+            self.register_buffer(
+                "coord_table_buffer",
+                torch.zeros(1025, arch.adaln_rank, dtype=_FP32_DTYPE),
+                persistent=False,
+            )
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """t: [M] -> [M, time_embed_dim] fp32.
 
         The sinusoidal embedding stays fp32 throughout and concatenates cosine
         values before sine values.
+
+        Pruned-checkpoint mode (``H3_PRUNED_ADALN=1``): the released timestep
+        MLP is replaced by an interpolated coordinate table of shape
+        ``[table_size, adaln_rank]``; the raw timestep indexes the table and
+        the output is the lerped fp32 rank-wide coordinate row.
         """
+        if getattr(self, "is_pruned", False) or getattr(self, "coord_table_buffer", None) is not None:
+            table = self.coord_table_buffer
+            steps = table.shape[0] - 1
+            position = t.to(table.dtype).flatten().clamp(0.0, 1.0) * steps
+            lower = position.floor().clamp(max=steps - 1).long()
+            weight = (position - lower).unsqueeze(-1)
+            return torch.lerp(table.index_select(0, lower), table.index_select(0, lower + 1), weight)
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=_FP32_DTYPE, device=t.device) / half)
         args = t.to(_FP32_DTYPE)[:, None] * freqs[None]
@@ -661,6 +698,12 @@ class MiniMaxH3AdalnProj(nn.Module):
     [M, t_dim] -> [M, 2H] -> chunk(2).
     """
 
+    # Pruned-checkpoint support: when arch.adaln_rank > 0 the AdaLN
+    # projection consumes rank-wide timestep coordinates produced by the
+    # interpolated-coordinate time embedder. The projection is bias-free
+    # (the folded bias is a separate fp32 buffer applied after the matmul)
+    # and no SiLU is applied (the table already stores coordinates of the
+    # activated curve).
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -679,6 +722,24 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        import os as _os
+        self.is_pruned = _os.environ.get("H3_PRUNED_ADALN") == "1" or arch.adaln_rank > 0
+        if self.is_pruned:
+            self.linear = ColumnParallelLinear(
+                arch.adaln_rank,
+                out_features,
+                bias=False,
+                gather_output=True,
+                params_dtype=_BF16_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.linear",
+            )
+            self.register_buffer(
+                "folded_bias",
+                torch.zeros(out_features, dtype=_FP32_DTYPE),
+                persistent=False,
+            )
+            return
         self.linear = ColumnParallelLinear(
             arch.time_embed_dim,
             out_features,
@@ -691,6 +752,12 @@ class MiniMaxH3AdalnProj(nn.Module):
 
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """t_emb: [M, t_dim] -> expand_ratio tensors of [M*modality_num, H]."""
+        if self.is_pruned:
+            x, _ = self.linear(t_emb.to(_BF16_DTYPE))
+            x = (x.float() + self.folded_bias).to(_BF16_DTYPE)
+            m = x.shape[0]
+            x = x.view(m * self.modality_num, self.expand_ratio * self.hidden_size)
+            return tuple(x.chunk(self.expand_ratio, dim=-1))
         x = nn.functional.silu(t_emb)
         x, _ = self.linear(x.to(_BF16_DTYPE))
         m = x.shape[0]
@@ -1111,7 +1178,7 @@ class MiniMaxH3DiTModel(nn.Module):
             arch,
             prefix="time_embedder",
         )
-        self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
+        self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len, rope_theta=getattr(arch, "rope_theta", 10000.0))
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
             quant_config,
@@ -1209,11 +1276,105 @@ class MiniMaxH3DiTModel(nn.Module):
         params = dict(self.named_parameters())
         params.update(dict(self.named_buffers()))
         loaded: set[str] = set()
+
+        import os as _os
+        import re as _re
+
+        def _normalize_pruned_key(name: str) -> str:
+            """Map pruned-checkpoint key names onto the released layout."""
+            if self.arch.adaln_rank <= 0:
+                return name
+            if name.startswith("transformer_blocks."):
+                name = "blocks." + name[len("transformer_blocks."):]
+            name = name.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.")
+            name = name.replace(".attn.norm_q.", ".attn.q_norm.")
+            name = name.replace(".attn.norm_k.", ".attn.k_norm.")
+            name = name.replace(".attn.to_out.0.", ".attn.out_proj.")
+            name = name.replace(".ff.net.0.proj.", ".mlp.fc1.")
+            name = name.replace(".ff.net.2.", ".mlp.fc2.")
+            name = name.replace("audio_proj_in.", "audio_patch_proj.")
+            name = name.replace("audio_proj_out.", "final_layer.audio_out.")
+            name = name.replace("context_embedder.", "condition_proj.")
+            name = name.replace("proj_in.", "video_patch_proj.")
+            name = name.replace("proj_out.", "final_layer.video_out.")
+            name = name.replace("norm_out.linear.", "final_layer.adaln_proj.linear.")
+            name = name.replace("norm_out.folded_bias", "final_layer.adaln_proj.folded_bias")
+            name = name.replace("norm_out.norm.", "final_layer.norm.")
+            return name
+
+        def _renamed(weights_iter):
+            for name, tensor in weights_iter:
+                yield _normalize_pruned_key(name), tensor
+
+        pruned_mode = _os.environ.get("H3_PRUNED_ADALN") == "1" or self.arch.adaln_rank > 0
+        if pruned_mode:
+            weights = _renamed(weights)
+        _pruned_qkv_buffer: dict[str, dict[str, torch.Tensor]] = {}
         for name, loaded_weight in weights:
+            if pruned_mode and name == "time_embedder.table":
+                te = getattr(self, "time_embedder", None)
+                if te is not None and getattr(te, "coord_table_buffer", None) is not None:
+                    te.coord_table_buffer.copy_(loaded_weight.to(_FP32_DTYPE))
+                    loaded.add(name)
+                continue
+            if pruned_mode and (
+                name.endswith(".attn.to_q.weight")
+                or name.endswith(".attn.to_k.weight")
+                or name.endswith(".attn.to_v.weight")
+            ):
+                base = name.rsplit(".to_", 1)[0]
+                part = name.rsplit(".to_", 1)[1][0]
+                pend = _pruned_qkv_buffer.setdefault(base, {})
+                pend[part] = loaded_weight
+                if len(pend) == 3:
+                    # The pruned repo stores plain [q; k; v] projections (the
+                    # same rows the grouped layout interleaves per head), so
+                    # concatenation reproduces the grouped fused layout
+                    # exactly - no reordering, just the head-major concat.
+                    fused = torch.cat([pend["q"], pend["k"], pend["v"]], dim=0).contiguous()
+                    del _pruned_qkv_buffer[base]
+                    fused_name = f"{base}.qkv_proj.weight"
+                    fparam = params.get(fused_name)
+                    if fparam is None:
+                        logger.warning("Skipping fused qkv with no param: %s", fused_name)
+                        continue
+                    floader = getattr(fparam, "weight_loader", default_weight_loader)
+                    floader(fparam, fused)
+                    loaded.add(fused_name)
+                continue
             param = params.get(name)
             if param is None:
+                if pruned_mode and name in ("adaln_basis", "adaln_mean"):
+                    continue  # pruned-side reconstruction artifacts; not needed at runtime
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
+            # Pruned-checkpoint routing: coordinate table and folded AdaLN
+            # biases are plain buffers; copy them directly.
+            if pruned_mode:
+                if name == "time_embedder.table":
+                    self.coord_table_buffer.copy_(loaded_weight.to(_FP32_DTYPE))
+                    loaded.add(name)
+                    continue
+                if name.endswith("adaln_proj.folded_bias"):
+                    block_prefix = name[: -len(".adaln_proj.folded_bias")]
+                    dst_name = (
+                        "final_layer.adaln_proj.folded_bias"
+                        if block_prefix == "final_layer"
+                        else f"{block_prefix}.adaln_proj.folded_bias"
+                    )
+                    dst = params.get(dst_name)
+                    if dst is None:
+                        logger.warning("Skipping folded bias with no buffer: %s", name)
+                        continue
+                    dst.copy_(loaded_weight.to(_FP32_DTYPE))
+                    loaded.add(name)
+                    continue
+            # Pruned repo stores the fused gate/up matrix value-first (up
+            # then gate) while the native fc1 is gate-first; swap halves so
+            # SiluAndMul gates on the correct projection.
+            if pruned_mode and name.endswith(".mlp.fc1.weight"):
+                first, second = loaded_weight.chunk(2, dim=0)
+                loaded_weight = torch.cat((second, first), dim=0).contiguous()
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             if name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.triton_utils import tl, triton
 

@@ -6,7 +6,13 @@ from multiprocessing import shared_memory as _shm
 from typing import Any
 
 from vllm_omni.config.yaml_util import to_dict as _omega_to_dict
-from vllm_omni.platforms import current_omni_platform
+def _get_platform():
+    # Deferred on purpose: resolving the platform during module import can hit
+    # a partially-initialized vllm_omni.platforms (import cycle via
+    # distributed omni_connectors). By call time imports have settled.
+    from vllm_omni.platforms import current_omni_platform
+
+    return current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +44,7 @@ def resolve_stage_physical_devices(
         raise TypeError(f"Expected str or int device IDs for stage initialization, got type {type(devices)}")
 
     device_list = _parse_device_list(devices)
-    env_var = current_omni_platform.device_control_env_var
+    env_var = _get_platform().device_control_env_var
     visible_devices = os.environ.get(env_var) if visible_baseline is _LIVE_DEVICE_ENV else visible_baseline
     if visible_devices is not None:
         visible_device_list = _parse_device_list(visible_devices)
@@ -91,7 +97,7 @@ def set_stage_devices(
         )
         if device_str is None:
             return None
-        current_omni_platform.set_device_control_env_var(device_str)
+        _get_platform().set_device_control_env_var(device_str)
         return device_str
 
     raise TypeError(f"Expected str or int device IDs for stage initialization, got type {type(devices)}")
