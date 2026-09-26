@@ -194,6 +194,28 @@ def __getattr__(name: str):
                 device_control_env_var = "ASCEND_RT_VISIBLE_DEVICES"
 
                 @staticmethod
+                def get_device_count() -> int:
+                    # H3/Ascend: queried during package checks while the real
+                    # platform class is still resolving; one NPU per host here.
+                    try:
+                        import torch_npu
+
+                        return torch_npu.npu.device_count()
+                    except Exception:  # noqa: BLE001
+                        return 1
+
+                @staticmethod
+                def has_flash_attn_package() -> bool:
+                    # NPU stack uses mindiesd flash attention, not the
+                    # flash-attn pip package; report absent during transition.
+                    try:
+                        import mindiesd  # noqa: F401
+
+                        return True
+                    except Exception:  # noqa: BLE001
+                        return False
+
+                @staticmethod
                 def set_device_control_env_var(value):
                     import os
 

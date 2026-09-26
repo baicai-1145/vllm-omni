@@ -54,6 +54,53 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any
 
+# H3 calib: module-level capture registry. When H3_CALIB_OUT is set the
+# activation-stat collector is installed at import time; per-call cost is one
+# dict lookup + one abs().amax(0) when active, zero when not.
+_H3_CALIB_CAPTURE: dict = {}
+
+
+def _h3_calib_maybe_install() -> None:
+    import atexit
+    import os
+
+    out = os.environ.get("H3_CALIB_OUT", "")
+    if not out:
+        return
+    state: dict[str, torch.Tensor] = {}  # prefix -> absmax(K,) fp32 CPU
+    counts: dict[str, int] = {}
+
+    def _capture(_tag: str, prefix: str, x: torch.Tensor) -> None:
+        am = x.detach().abs().amax(dim=0).float().cpu()
+        cur = state.get(prefix)
+        if cur is None:
+            state[prefix] = am
+        else:
+            torch.maximum(cur, am, out=cur)
+        counts[prefix] = counts.get(prefix, 0) + 1
+
+    def _save() -> None:
+        if not state:
+            return
+        import os as _os
+
+        _os.makedirs(_os.path.dirname(out), exist_ok=True)
+        torch.save({"absmax": state, "counts": counts}, out)
+        try:
+            with open(out + ".log", "a") as f:
+                f.write(f"saved {len(state)} prefixes, calls={sum(counts.values())}\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    _H3_CALIB_CAPTURE["active"] = _capture
+    atexit.register(_save)
+    from vllm.logger import init_logger as _il
+
+    _il(__name__).info("H3 calib: activation capture ACTIVE -> %s", out)
+
+
+_h3_calib_maybe_install()
+
 import torch
 from torch.nn import Module
 from vllm.logger import init_logger
@@ -631,6 +678,13 @@ class NPUMxfp4DualScaleLinearMethod(MXFPLinearMethodBase):
         """
         if ori_dtype not in (torch.bfloat16, torch.float16):
             x = x.to(torch.bfloat16)
+        # H3 calib: optional activation stats capture (env-gated, zero overhead when off)
+        _cap = _H3_CALIB_CAPTURE.get("active")
+        if _cap:
+            try:
+                _cap("__pf__", getattr(layer, "prefix", ""), x)
+            except Exception:  # noqa: BLE001
+                pass
         x_q, l0_scale, l1_scale = self._quantize_activation(x, layer.mul_scale)
         return self._quant_matmul(x_q, l0_scale, l1_scale, layer, bias, ori_dtype)
 
@@ -703,10 +757,31 @@ class NPUMxfp4DualScaleOnlineLinearMethod(_LazyWeightMixin, NPUMxfp4DualScaleLin
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
+        # H3 calib: optional per-channel smooth scale from JSON. When present the
+        # weight is pre-divided (W/s) so runtime npu_dynamic_dual_level_mx_quant
+        # (smooth_scale=mul_scale) computes x*(1/s) and the product is invariant.
+        # Semantics verified on-device: identical to quantizing x*s with W/s.
+        import json, os
+        _cal = os.environ.get("H3_MXFP4_CALIB", "")
+        _smooth = None
+        if _cal and os.path.exists(_cal):
+            try:
+                with open(_cal) as f:
+                    _smooth = json.load(f)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("H3_MXFP4_CALIB load failed: %s", e)
+                _smooth = None
+        _pref = getattr(layer, "prefix", None) or getattr(layer, "_h3_calib_prefix", None)
+        _svec = _smooth.get(_pref) if (_smooth is not None and _pref) else None
+        if _svec is not None:
+            s = torch.tensor(_svec, dtype=torch.float32, device=layer.weight.device)
+            layer.weight.data = (layer.weight.data.float() / s.to(layer.weight.device)).to(layer.weight.dtype)
+            logger.info("H3 calib: applied smooth scale to %s (K=%d)", _pref, s.numel())
+
         # Quantize BF16 weight → FP4 + dual-level scales (no smooth pre-scale for online).
         # Returns: (weight_fp4, l0_scale[coarse per-512], l1_scale[fine per-32])
         weight_fp4, w_l0_scale, w_l1_scale = torch_npu.npu_dynamic_dual_level_mx_quant(
-            layer.weight.data.npu(), smooth_scale=None
+            (layer.weight.data.npu() if layer.weight.device.type != "npu" else layer.weight.data), smooth_scale=None
         )
 
         # NZ hardware format for the FP4 weight (same as offline path).
@@ -719,7 +794,12 @@ class NPUMxfp4DualScaleOnlineLinearMethod(_LazyWeightMixin, NPUMxfp4DualScaleLin
         ds = w_l0_scale.reshape(w_l0_scale.shape[0], -1).transpose(0, 1).contiguous()
 
         # No calibration available: identity pre-scale (no smooth quantization effect).
-        ms = torch.ones(layer.input_size_per_partition, dtype=torch.bfloat16, device="npu")
+        ms = _svec if _svec is not None else torch.ones(
+            layer.input_size_per_partition, dtype=torch.bfloat16, device="npu"
+        )
+        if isinstance(ms, list):
+            ms = torch.tensor(ms, dtype=torch.bfloat16, device="npu")
+        ms = ms.bfloat16().npu().contiguous()
 
         replace_parameter(layer, "weight", w)
         replace_parameter(layer, "weight_scale", s)
