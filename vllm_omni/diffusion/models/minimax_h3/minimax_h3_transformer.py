@@ -40,6 +40,8 @@ from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
     rms_norm_indexed_scale_shift,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.pab import get_pab_manager, is_pab_enabled
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -472,6 +474,8 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
         )
+        self.is_dit_layer = prefix.startswith("blocks.")
+        self.layer_idx = extract_layer_index(prefix) if self.is_dit_layer else None
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -610,6 +614,11 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
+        if self.is_dit_layer and is_pab_enabled():
+            pab = get_pab_manager()
+            should_broadcast, cached = pab.should_broadcast(self.layer_idx)
+            if should_broadcast and cached is not None:
+                return cached
         qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
@@ -630,24 +639,56 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
             )
 
+        if getattr(self, "is_dit_layer", False):
+            try:
+                from vllm_omni.diffusion.models.minimax_h3.attn_hook import maybe_capture_attention
+                maybe_capture_attention(self.layer_idx, q, k, v)
+            except Exception as _e:
+                pass
+
         # Each request contributes a document for its rows plus one for any
         # nonempty alignment padding. Local/Ulysses backends unpad it, while
         # Ring keeps aligned rows for fixed-size P2P buffers.
-        out = self._run_packed_attention(
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            # Before Ulysses, q contains only this rank's row shard. The
-            # backend receives the global sequence after all-to-all, so carry
-            # its Python length explicitly instead of inferring it from q.
-            packed_total=packed_total if packed_total is not None else q.shape[0],
-            num_requests=num_requests,
-            video_layout=video_layout,
-        )
+        #
+        # Block-sparse fast path (H3_BLOCK_SPARSE_RATIO>0, single request):
+        # FlashAttention is 68% of the step at 99% MAC, so we buy speed by
+        # skipping S^2 blocks via npu_block_sparse_attention with a pooled-QK
+        # estimated mask. Off by default; falls through to the packed path.
+        _bs_keep = 0.0
+        if getattr(self, "is_dit_layer", False) and num_requests == 1:
+            try:
+                from vllm_omni.diffusion.models.minimax_h3.block_sparse_attn import (
+                    ratio_for_layer as _bs_ratio,
+                )
+
+                _bs_keep = _bs_ratio(getattr(self, "layer_idx", 0))
+            except Exception:  # noqa: BLE001
+                _bs_keep = 0.0
+        if _bs_keep > 0.0:
+            from vllm_omni.diffusion.models.minimax_h3.block_sparse_attn import (
+                block_sparse_attention as _bs_attn,
+            )
+
+            out = _bs_attn(q, k, v, _bs_keep)
+        else:
+            out = self._run_packed_attention(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                # Before Ulysses, q contains only this rank's row shard. The
+                # backend receives the global sequence after all-to-all, so carry
+                # its Python length explicitly instead of inferring it from q.
+                packed_total=packed_total if packed_total is not None else q.shape[0],
+                num_requests=num_requests,
+                video_layout=video_layout,
+            )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
+        if self.is_dit_layer and is_pab_enabled():
+            pab = get_pab_manager()
+            pab.record_attention(self.layer_idx, out)
         return out
 
 
