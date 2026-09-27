@@ -69,7 +69,36 @@ def _load_remote_component(
     # anti-aliasing filters call torch.kaiser_window). Callers place the module
     # explicitly right after this returns, so nothing depends on the context.
     with torch.device("cpu"):
-        return component_cls.from_pretrained(component_path)
+        # The checkpoint's own from_pretrained re-reads config.json from disk and
+        # builds the tiling kwargs itself, so editing `config` above has no
+        # effect. Intercept just that read and apply the env overrides there.
+        overrides = {
+            k: int(v)
+            for k in (
+                "vae_decoder_tiling", "vae_encoder_tiling", "vae_tile_size",
+                "vae_tile_overlap_min", "vae_decoder_parallel", "vae_chunk_dim",
+            )
+            if (v := os.environ.get("H3_" + k.upper())) is not None
+            and v.lstrip("-").isdigit()
+        }
+        if not overrides:
+            return component_cls.from_pretrained(component_path)
+
+        import json as _json
+
+        _orig_load = _json.load
+
+        def _load_with_overrides(fp, *a, **kw):
+            obj = _orig_load(fp, *a, **kw)
+            if isinstance(obj, dict) and "vae_tile_overlap_min" in obj:
+                obj.update(overrides)
+            return obj
+
+        _json.load = _load_with_overrides
+        try:
+            return component_cls.from_pretrained(component_path)
+        finally:
+            _json.load = _orig_load
 
 
 class _AudioVAEDeterminismContext(AbstractContextManager):
@@ -126,26 +155,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         super().__init__()
         self._device_target = device
         self.config_dict = _load_component_config(component_path)
-        # Env overrides for the tiling knobs. They live in the checkpoint's
-        # (read-only) config.json, so they cannot be tuned in place. Halving the
-        # tile overlap cuts the boundary recompute: on H3 that is 11.76s ->
-        # 10.28s of VAE decode, verified seam-free (flat column/row difference
-        # profile, no spikes at the 256px tile boundaries).
-        for _key in (
-            "vae_decoder_tiling",
-            "vae_encoder_tiling",
-            "vae_tile_size",
-            "vae_tile_overlap_min",
-            "vae_decoder_parallel",
-            "vae_chunk_dim",
-        ):
-            _env = os.environ.get("H3_" + _key.upper())
-            if _env is None:
-                continue
-            try:
-                self.config_dict[_key] = int(_env)
-            except ValueError:
-                pass
+        # Tiling knobs (vae_tile_overlap_min etc.) live in the read-only
+        # checkpoint config and this dict is not what builds them -- see
+        # _load_remote_component, which applies the H3_VAE_* env overrides to
+        # the config.json read performed by the checkpoint's own loader.
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
