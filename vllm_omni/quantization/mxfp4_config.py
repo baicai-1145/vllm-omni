@@ -935,11 +935,15 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
         is_checkpoint_serialized: bool = False,
         ignored_layers: list[str] | None = None,
         num_bf16_fallback_layers: int = 5,
+        int8_layers: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.is_checkpoint_serialized = is_checkpoint_serialized
         self.ignored_layers = ignored_layers or []
         self.num_bf16_fallback_layers = num_bf16_fallback_layers
+        # H3 mixed-precision: per-layer W8A8 dynamic-int8 override (sensitivity-
+        # driven: mlp.fc2 holds ~90% of quantization error energy).
+        self.int8_layers = int8_layers or []
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -968,10 +972,12 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
         num_bf16_fallback_layers = cls.get_from_keys_or(config, ["num_bf16_fallback_layers"], 5)
+        int8_layers = cls.get_from_keys_or(config, ["int8_layers"], None)
         return cls(
             is_checkpoint_serialized=is_serialized,
             ignored_layers=ignored_layers,
             num_bf16_fallback_layers=num_bf16_fallback_layers,
+            int8_layers=int8_layers,
         )
 
     def get_quant_method(
@@ -1004,6 +1010,15 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
             fused_mapping=self.packed_modules_mapping,
         ):
             return UnquantizedLinearMethod()
+        # H3 mixed-precision: per-layer dynamic-int8 (W8A8) override.
+        if self.int8_layers and is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.int8_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            from .int8_config import DiffusionInt8Config, NPUInt8OnlineLinearMethod
+
+            return NPUInt8OnlineLinearMethod(DiffusionInt8Config())
         block_idx = _parse_block_idx(prefix)
         if block_idx is not None and block_idx < self.num_bf16_fallback_layers:
             return UnquantizedLinearMethod()
