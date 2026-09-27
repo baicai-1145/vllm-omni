@@ -65,38 +65,77 @@ def _h3_calib_maybe_install() -> None:
     import os
 
     out = os.environ.get("H3_CALIB_OUT", "")
-    if not out:
+    hess_out = os.environ.get("H3_HESS_OUT", "")  # H3 GPTQ: Hessian capture
+    if not out and not hess_out:
         return
     state: dict[str, torch.Tensor] = {}  # prefix -> absmax(K,) fp32 CPU
     counts: dict[str, int] = {}
+    # Hessian accumulators. Full K x K fp32 for all 189 layers needs ~14 GB RAM
+    # (32G cgroup!) -> store ONLY the diagonal + block-diagonal approximation:
+    # GPTQ with diagonal H = per-column independent weighted MSE (no error
+    # propagation via Cholesky, but still reconstruction-aware vs plain RTN).
+    # Diag cost: K floats/layer (~1.5 MB total). Full H only for H3_HESS_FULL=1.
+    hess: dict[str, torch.Tensor] = {}
+    hess_n: dict[str, int] = {}
+    hess_every = int(os.environ.get("H3_HESS_EVERY", "1"))  # capture cadence (calls)
+    hess_full = os.environ.get("H3_HESS_FULL", "0") == "1"
+    full_allow = {"blocks.45.mlp.fc2"}  # single test layer (K=14336 full H ~782 MB)
 
     def _capture(_tag: str, prefix: str, x: torch.Tensor) -> None:
-        am = x.detach().abs().amax(dim=0).float().cpu()
-        cur = state.get(prefix)
-        if cur is None:
-            state[prefix] = am
-        else:
-            torch.maximum(cur, am, out=cur)
-        counts[prefix] = counts.get(prefix, 0) + 1
+        if out:
+            am = x.detach().abs().amax(dim=0).float().cpu()
+            cur = state.get(prefix)
+            if cur is None:
+                state[prefix] = am
+            else:
+                torch.maximum(cur, am, out=cur)
+            counts[prefix] = counts.get(prefix, 0) + 1
+        if hess_out and (counts.get(prefix, 0) % hess_every == 0):
+            xf = x.detach().reshape(-1, x.shape[-1]).float()
+            if xf.shape[0] > 512:
+                idx = torch.randint(0, xf.shape[0], (512,), device=xf.device)
+                xf = xf[idx]
+            if hess_full or prefix in full_allow:
+                h = (xf.t() @ xf).cpu()
+            else:
+                h = (xf * xf).sum(dim=0).cpu()  # diagonal only
+            cur = hess.get(prefix)
+            if cur is None:
+                hess[prefix] = h
+            else:
+                cur += h
+            hess_n[prefix] = hess_n.get(prefix, 0) + xf.shape[0]
 
     def _save() -> None:
-        if not state:
-            return
         import os as _os
 
-        _os.makedirs(_os.path.dirname(out), exist_ok=True)
-        torch.save({"absmax": state, "counts": counts}, out)
-        try:
-            with open(out + ".log", "a") as f:
-                f.write(f"saved {len(state)} prefixes, calls={sum(counts.values())}\n")
-        except Exception:  # noqa: BLE001
-            pass
+        if state:
+            _os.makedirs(_os.path.dirname(out), exist_ok=True)
+            torch.save({"absmax": state, "counts": counts}, out)
+            try:
+                with open(out + ".log", "a") as f:
+                    f.write(f"saved {len(state)} prefixes, calls={sum(counts.values())}\n")
+            except Exception:  # noqa: BLE001
+                pass
+        if hess and hess_out:
+            _os.makedirs(_os.path.dirname(hess_out), exist_ok=True)
+            torch.save({"hess": hess, "n": hess_n}, hess_out)
+            try:
+                with open(hess_out + ".log", "a") as f:
+                    f.write(
+                        f"saved {len(hess)} hessians, tokens={sum(hess_n.values())}\n"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
 
     _H3_CALIB_CAPTURE["active"] = _capture
     atexit.register(_save)
     from vllm.logger import init_logger as _il
 
-    _il(__name__).info("H3 calib: activation capture ACTIVE -> %s", out)
+    if out:
+        _il(__name__).info("H3 calib: activation capture ACTIVE -> %s", out)
+    if hess_out:
+        _il(__name__).info("H3 GPTQ: Hessian capture ACTIVE -> %s (every %d)", hess_out, hess_every)
 
 
 _h3_calib_maybe_install()
@@ -771,12 +810,43 @@ class NPUMxfp4DualScaleOnlineLinearMethod(_LazyWeightMixin, NPUMxfp4DualScaleLin
             except Exception as e:  # noqa: BLE001
                 logger.warning("H3_MXFP4_CALIB load failed: %s", e)
                 _smooth = None
+        # H3 GPTQ: optional rebuilt weights {prefix: Wq bf16}. Layers present here
+        # bypass smooth scaling entirely (GPTQ ran on raw W) — the weight is the
+        # already-grid-optimal bf16; the online quantizer reproduces its grid points
+        # (verified drift ~3%, err 0.129->0.061 on blocks.45).
+        _gptq = None
+        _gq = os.environ.get("H3_GPTQ_WEIGHTS", "")
+        _gq_shards = os.environ.get("H3_GPTQ_SHARDS", "")
+        if _gq_shards:
+            # pattern like /path/gptq_shard_ (files gptq_shard_0.pt ... N)
+            _gptq = {}
+            i = 0
+            import glob as _glob
+            for p in sorted(_glob.glob(_gq_shards + "*.pt")):
+                try:
+                    _d = torch.load(p, map_location="cpu", weights_only=False, mmap=True)
+                    _gptq.update(_d)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("H3_GPTQ shard %s load failed: %s", p, e)
+        elif _gq and os.path.exists(_gq):
+            try:
+                _gptq = torch.load(_gq, map_location="cpu", weights_only=False, mmap=True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("H3_GPTQ_WEIGHTS load failed: %s", e)
+                _gptq = None
         _pref = getattr(layer, "prefix", None) or getattr(layer, "_h3_calib_prefix", None)
-        _svec = _smooth.get(_pref) if (_smooth is not None and _pref) else None
-        if _svec is not None:
-            s = torch.tensor(_svec, dtype=torch.float32, device=layer.weight.device)
-            layer.weight.data = (layer.weight.data.float() / s.to(layer.weight.device)).to(layer.weight.dtype)
-            logger.info("H3 calib: applied smooth scale to %s (K=%d)", _pref, s.numel())
+        _gq_w = _gptq.get(_pref) if (_gptq is not None and _pref) else None
+        if _gq_w is not None:
+            layer.weight.data = _gq_w.to(layer.weight.device).to(layer.weight.dtype)
+            _svec = None  # GPTQ layers: no smoothing, identity mul_scale
+            _gptq.pop(_pref, None)  # drop consumed tensors so mmap pages can be reclaimed
+            logger.info("H3 GPTQ: rebuilt weight applied to %s", _pref)
+        else:
+            _svec = _smooth.get(_pref) if (_smooth is not None and _pref) else None
+            if _svec is not None:
+                s = torch.tensor(_svec, dtype=torch.float32, device=layer.weight.device)
+                layer.weight.data = (layer.weight.data.float() / s.to(layer.weight.device)).to(layer.weight.dtype)
+                logger.info("H3 calib: applied smooth scale to %s (K=%d)", _pref, s.numel())
 
         # Quantize BF16 weight → FP4 + dual-level scales (no smooth pre-scale for online).
         # Returns: (weight_fp4, l0_scale[coarse per-512], l1_scale[fine per-32])
