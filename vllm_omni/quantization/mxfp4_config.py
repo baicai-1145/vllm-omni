@@ -79,7 +79,15 @@ def _h3_calib_maybe_install() -> None:
     hess_n: dict[str, int] = {}
     hess_every = int(os.environ.get("H3_HESS_EVERY", "1"))  # capture cadence (calls)
     hess_full = os.environ.get("H3_HESS_FULL", "0") == "1"
-    full_allow = {"blocks.45.mlp.fc2"}  # single test layer (K=14336 full H ~782 MB)
+    # Full-H allowlist: driven by env H3_HESS_FULL_LAYERS (comma list of runtime
+    # prefixes). Memory bound: each full H is K^2*4B on CPU (5376^2=110MB,
+    # 7168^2=196MB, 14336^2=782MB); the capture batches a few layers per run.
+    _fa = os.environ.get("H3_HESS_FULL_LAYERS", "")
+    full_allow = {p.strip() for p in _fa.split(",") if p.strip()} if _fa else set()
+    if not full_allow:
+        full_allow = {"blocks.45.mlp.fc2"}  # legacy default
+    # Rotate output path per run so batches can be merged offline.
+    hess_out = hess_out if not os.environ.get("H3_HESS_SUFFIX", "") else hess_out.replace(".pt", f"{os.environ['H3_HESS_SUFFIX']}.pt")
 
     def _capture(_tag: str, prefix: str, x: torch.Tensor) -> None:
         if out:
@@ -96,7 +104,7 @@ def _h3_calib_maybe_install() -> None:
                 idx = torch.randint(0, xf.shape[0], (512,), device=xf.device)
                 xf = xf[idx]
             if hess_full or prefix in full_allow:
-                h = (xf.t() @ xf).cpu()
+                h = (xf.t() @ xf).cpu().to(torch.bfloat16)  # bf16 halves RAM (14336² = 391MB)
             else:
                 h = (xf * xf).sum(dim=0).cpu()  # diagonal only
             cur = hess.get(prefix)
@@ -838,9 +846,12 @@ class NPUMxfp4DualScaleOnlineLinearMethod(_LazyWeightMixin, NPUMxfp4DualScaleLin
         _gq_w = _gptq.get(_pref) if (_gptq is not None and _pref) else None
         if _gq_w is not None:
             layer.weight.data = _gq_w.to(layer.weight.device).to(layer.weight.dtype)
-            _svec = None  # GPTQ layers: no smoothing, identity mul_scale
+            # GPTQ weights are rebuilt IN THE SMOOTH DOMAIN (W/s grid) when the
+            # layer has a smooth vector — keep _svec set so the ms below uses
+            # it and A4 benefits stay (online path builds mul_scale from _svec).
+            _svec = _smooth.get(_pref) if (_smooth is not None and _pref) else None
             _gptq.pop(_pref, None)  # drop consumed tensors so mmap pages can be reclaimed
-            logger.info("H3 GPTQ: rebuilt weight applied to %s", _pref)
+            logger.info("H3 GPTQ: rebuilt weight applied to %s%s", _pref, "+smooth" if _svec else "")
         else:
             _svec = _smooth.get(_pref) if (_smooth is not None and _pref) else None
             if _svec is not None:
