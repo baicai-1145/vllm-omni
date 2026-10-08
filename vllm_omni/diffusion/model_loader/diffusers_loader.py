@@ -323,7 +323,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-
         use_multithread = (
             use_safetensors
             and getattr(self.od_config, "enable_multithread_weight_load", False)

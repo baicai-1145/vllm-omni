@@ -10,6 +10,7 @@ layout.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -61,6 +62,9 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+# Opt-in device-side region profiler (H3_PROFILE=1). No-op otherwise.
+from vllm_omni.diffusion.models.minimax_h3.h3_profiler import region as _prof_region
 
 
 # Packed multi-request forwards require the attention backend to actually
@@ -658,34 +662,67 @@ class MiniMaxH3Attention(nn.Module):
         if getattr(self, "is_dit_layer", False) and num_requests == 1:
             try:
                 from vllm_omni.diffusion.models.minimax_h3.block_sparse_attn import (
+                    BLK as _bs_blk,
                     ratio_for_layer as _bs_ratio,
                 )
 
                 _bs_keep = _bs_ratio(getattr(self, "layer_idx", 0))
+                # One-shot packed-length record: the BlockSparse reshape needs
+                # S % BLK == 0, so knowing S for a given canvas tells us up front
+                # whether the sparse path is reachable or silently falls back.
+                if not getattr(self, "_bs_s_logged", False):
+                    self._bs_s_logged = True
+                    _s = q.shape[0]
+                    logger.info(
+                        "BlockSparse reachability: packed S=%d, BLK=%d, S%%BLK=%d -> %s",
+                        _s, _bs_blk, _s % _bs_blk,
+                        "sparse OK" if _s % _bs_blk == 0 else "will fall back to dense",
+                    )
+                # The pooled-QK mask pools with reshape(nb, BLK, ...) and the op
+                # takes a single block size, so both require S % BLK == 0. Only
+                # 768p-class canvases satisfy that by construction
+                # (S=37760=295*128). Below that the packed tail is ragged
+                # (e.g. 896x512 gives S=17088, 17088%128=64) and the reshape
+                # fails. Fall back to the dense packed path so those canvases
+                # stay correct instead of failing the whole generation: FA is
+                # only ~12% of a step, so sparse attention is worth little at
+                # low resolution anyway -- the token reduction is the real lever.
+                if _bs_keep > 0.0 and q.shape[0] % _bs_blk != 0:
+                    if not getattr(self, "_bs_align_fallback_warned", False):
+                        self._bs_align_fallback_warned = True
+                        logger.warning(
+                            "BlockSparse disabled for this forward: packed length %d "
+                            "is not a multiple of block size %d. Expected below "
+                            "768p-class canvases; using dense attention.",
+                            q.shape[0], _bs_blk,
+                        )
+                    _bs_keep = 0.0
             except Exception:  # noqa: BLE001
                 _bs_keep = 0.0
-        if _bs_keep > 0.0:
-            from vllm_omni.diffusion.models.minimax_h3.block_sparse_attn import (
-                block_sparse_attention as _bs_attn,
-            )
+        with _prof_region("attn.core"):
+            if _bs_keep > 0.0:
+                from vllm_omni.diffusion.models.minimax_h3.block_sparse_attn import (
+                    block_sparse_attention as _bs_attn,
+                )
 
-            out = _bs_attn(q, k, v, _bs_keep)
-        else:
-            out = self._run_packed_attention(
-                q,
-                k,
-                v,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                # Before Ulysses, q contains only this rank's row shard. The
-                # backend receives the global sequence after all-to-all, so carry
-                # its Python length explicitly instead of inferring it from q.
-                packed_total=packed_total if packed_total is not None else q.shape[0],
-                num_requests=num_requests,
-                video_layout=video_layout,
-            )
+                out = _bs_attn(q, k, v, _bs_keep)
+            else:
+                out = self._run_packed_attention(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    # Before Ulysses, q contains only this rank's row shard. The
+                    # backend receives the global sequence after all-to-all, so carry
+                    # its Python length explicitly instead of inferring it from q.
+                    packed_total=packed_total if packed_total is not None else q.shape[0],
+                    num_requests=num_requests,
+                    video_layout=video_layout,
+                )
         out = out.reshape(total, self.num_heads * self.head_dim)
-        out, _ = self.out_proj(out)
+        with _prof_region("attn.out_proj"):
+            out, _ = self.out_proj(out)
         if self.is_dit_layer and is_pab_enabled():
             pab = get_pab_manager()
             pab.record_attention(self.layer_idx, out)
@@ -724,9 +761,12 @@ class MiniMaxH3MLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
-        out, _ = self.fc2(hidden)
+        with _prof_region("mlp.fc1"):
+            hidden, _ = self.fc1(x)
+        with _prof_region("mlp.act"):
+            hidden = self.act_fn(hidden)
+        with _prof_region("mlp.fc2"):
+            out, _ = self.fc2(hidden)
         return out
 
 
@@ -942,47 +982,53 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = self.adaln_proj(t_emb)
+        with _prof_region("block.adaln"):
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = rms_norm_indexed_scale_shift(
-            x,
-            self.norm1.weight,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            self.norm1.variance_epsilon,
-        )
-        h = self.attn(
-            h,
-            rope_table=rope_table,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            packed_total=packed_total,
-            num_requests=num_requests,
-            sp_seq_lens=sp_seq_lens,
-            video_layout=video_layout,
-        )
-        x, h = indexed_gate_rms_norm_scale_shift(
-            residual,
-            gate_msa,
-            h,
-            self.norm2.weight,
-            shift_mlp,
-            scale_mlp,
-            combined_indices,
-            self.norm2.variance_epsilon,
-        )
+        with _prof_region("block.norm1"):
+            h = rms_norm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
+        with _prof_region("block.attn_total"):
+            h = self.attn(
+                h,
+                rope_table=rope_table,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=packed_total,
+                num_requests=num_requests,
+                sp_seq_lens=sp_seq_lens,
+                video_layout=video_layout,
+            )
+        with _prof_region("block.norm2_gate"):
+            x, h = indexed_gate_rms_norm_scale_shift(
+                residual,
+                gate_msa,
+                h,
+                self.norm2.weight,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.variance_epsilon,
+            )
         residual = x
-        h = self.mlp(h)
-        return indexed_gate(residual, gate_mlp, h, combined_indices)
+        with _prof_region("block.mlp_total"):
+            h = self.mlp(h)
+        with _prof_region("block.final_gate"):
+            return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
 class MiniMaxH3FinalLayer(nn.Module):

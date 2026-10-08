@@ -68,6 +68,11 @@ def ratio_for_layer(layer_idx: int, num_layers: int = 50) -> float:
 def build_mask(q: torch.Tensor, k: torch.Tensor, keep: float) -> torch.Tensor:
     """q,k: [S, H, D] packed. Returns int8 block mask [1, H, nb, nb]."""
     s, h, d = q.shape
+    if s % BLK != 0:
+        raise ValueError(
+            f"build_mask requires S % {BLK} == 0, got S={s} "
+            f"(S % {BLK} = {s % BLK})"
+        )
     nb = (s + BLK - 1) // BLK
     if nb < 2:
         return torch.ones(1, h, nb, nb, dtype=torch.int8, device=q.device)
@@ -88,6 +93,17 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                            keep: float) -> torch.Tensor:
     """Packed [S, H, D] attention via npu_block_sparse_attention. Returns [S, H, D]."""
     s, h, d = q.shape
+    if s % BLK != 0:
+        # build_mask pools with reshape(nb, BLK, ...) and the op is given a
+        # single block size, both of which require S to be a multiple of BLK.
+        # Only 768p-class canvases happen to satisfy this (S=37760=295*128);
+        # lower resolutions land on a ragged tail (e.g. S=14912=116.5*128)
+        # and used to fail deep inside a reshape with a size mismatch. The
+        # caller must gate on this and fall back to dense FA.
+        raise ValueError(
+            f"block_sparse_attention requires S % {BLK} == 0, got S={s} "
+            f"(S % {BLK} = {s % BLK}); use the dense packed path instead"
+        )
     nb = (s + BLK - 1) // BLK
     mask = build_mask(q, k, keep)
     # BNSD views of the packed tensors

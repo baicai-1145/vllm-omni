@@ -358,6 +358,16 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
     ) -> None:
         del loaded_shard_id
+        # int8 serialized checkpoints carry a (out, 1) weight_scale next to the
+        # (out, in) weight. The weight shards on the INPUT dim, but the scale has
+        # no input dim -- it shards on the OUTPUT dim. Without this branch the
+        # scale hit narrow(1, 0, input_size_per_partition) and raised
+        # "start (0) + length (25600) exceeds dimension size (1)".
+        if loaded_weight.dim() == 2 and loaded_weight.shape[1] == 1:
+            shard = param.data.shape[0]
+            start = self._tp_rank * shard
+            param.data.copy_(loaded_weight.narrow(0, start, shard))
+            return
         shard_size = self.input_size_per_partition
         start_idx = self._tp_rank * shard_size
         param.data.copy_(loaded_weight.narrow(1, start_idx, shard_size))
@@ -1215,6 +1225,25 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             # Listed in full: this aborts startup, so the message is the only diagnostic.
             raise RuntimeError(f"MiniMax H3 text encoder weights not loaded: {len(missing)} params: {missing}")
         return loaded
+
+    def post_load_weights(self) -> None:
+        """Run the quantization method's post-load step on every quantized Linear.
+
+        The pipeline used to skip this for the text encoder
+        (``if prefix != "text_encoder."``), and this class had no such method at
+        all. Without it an int8 encoder keeps the raw checkpoint layout, so
+        ``quant_method.apply`` hands an int8 tensor to a path that expects the
+        post-processed one and aclnnMatmul rejects DT_INT8. The DiT reaches the
+        equivalent step through its own post_load_weights; the encoder has no
+        such hook, so it is added here.
+        """
+        for module in self.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None or isinstance(quant_method, UnquantizedLinearMethod):
+                continue
+            process = getattr(quant_method, "process_weights_after_loading", None)
+            if callable(process):
+                process(module)
 
     def load_to_device(self) -> None:
         if not self.is_loaded:

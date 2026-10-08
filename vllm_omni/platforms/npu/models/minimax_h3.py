@@ -99,7 +99,18 @@ def npu_swiglu_from_packed(gate_up: torch.Tensor) -> torch.Tensor:
 
 
 def _forward_minimax_h3_qwen3vl_text_mlp_npu(self: Any, x: torch.Tensor) -> torch.Tensor:
-    """Run the Qwen3-VL MLP with one packed GEMM and fused SwiGLU."""
+    """Run the Qwen3-VL MLP with one packed GEMM and fused SwiGLU.
+
+    This replaces ``MiniMaxH3Qwen3VLTextMLP.forward`` wholesale, so it must carry
+    the quantized branch itself: ``F.linear(x, weight)`` hands an int8 weight
+    straight to aclnnMatmul, which rejects DT_INT8. For an int8 layer the GEMM has
+    to go through ``quant_method.apply``; the fused SwiGLU is then applied to the
+    bf16 result, so the Ascend fast path is kept either way.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.encoder import _is_quantized_linear
+
+    if _is_quantized_linear(self.gate_up_proj):
+        return self.down_proj(npu_swiglu_from_packed(self.gate_up_proj(x)))
     gate_up = F.linear(x, self.gate_up_proj.weight)
     return self.down_proj(npu_swiglu_from_packed(gate_up))
 

@@ -13,6 +13,8 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
+import os
+
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
@@ -291,6 +293,7 @@ def minimax_h3_denoise_loop(
     )
     update = positive.update_mask_dev
     audio_update = positive.audio_update_mask_dev
+
 
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):

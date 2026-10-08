@@ -431,8 +431,17 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
         super().create_weights(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        # The transposes below are NOT idempotent, and this hook runs twice on the
+        # diffusion path: once from MiniMaxH3Qwen3VLEncoder.post_load_weights and
+        # once from DiffusersPipelineLoader._process_weights_after_loading. Without
+        # this guard the second call transposes the weights back and
+        # aclnnQuantMatmulV5 rejects them (x1 K=5120 vs x2 K=10240). The online
+        # variants below already carry the same guard; this one was missing it.
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
         layer.weight.data = layer.weight.data.t().contiguous()
         layer.weight_scale.data = layer.weight_scale.data.squeeze()
+        layer._already_called_process_weights_after_loading = True
 
     def apply(
         self,

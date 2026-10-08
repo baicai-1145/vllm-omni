@@ -1081,8 +1081,13 @@ class MiniMaxH3Pipeline(
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
                 stream = self._fasth3.apply(stream)
             loaded = component.load_weights(stream)
-            if prefix != "text_encoder.":
-                component.post_load_weights()
+            # The text encoder was excluded here, but it has no post-load hook of its
+            # own, so a quantized encoder never ran process_weights_after_loading.
+            # post_load_weights is now defined on MiniMaxH3Qwen3VLEncoder; components
+            # that do not define it are left alone.
+            post_load = getattr(component, "post_load_weights", None)
+            if callable(post_load):
+                post_load()
             loaded_with_prefix.update(prefix + name for name in loaded)
         # Both VAEs load eagerly in ``__init__`` rather than through
         # ``weights_sources``. The text encoder uses the shared component

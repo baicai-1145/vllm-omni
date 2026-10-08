@@ -4,8 +4,58 @@ import torch.nn.functional as F
 
 _CAPTURED = set()
 _STEP_COUNTS = {}
+_QKLOG = set()
+
+def _fake_quant_per_token(t, bits):
+    """Symmetric per-token uniform quantisation, in place.
+
+    Matches what a real int8 attention kernel would do to Q and K: one scale
+    per token (row), computed dynamically. This is the same granularity as
+    torch_npu.npu_dynamic_quant's pertoken_scale, which is the path the int8
+    roof (742 TOP/s) was measured through.
+    """
+    qmax = float(2 ** (bits - 1) - 1)
+    s = t.abs().amax(dim=-1, keepdim=True).float().div(qmax).clamp(min=1e-12)
+    t.copy_((t.float() / s).round_().clamp_(-qmax, qmax).mul_(s).to(t.dtype))
+    return t
+
+
+def _apply_qk_int8(layer_idx, q, k, v):
+    """Emulate int8 attention inputs on the real activations. Quality only.
+
+    This deliberately does NOT make anything faster: the arithmetic is still the
+    bf16 FlashAttention. The question it answers is whether H3 can tolerate the
+    int8 Q/K error at all -- if it cannot, writing an int8 AscendC kernel is
+    pointless and the whole direction can be closed.
+    """
+    bits = int(os.environ.get("H3_ATTN_QK_INT8", "0"))
+    if bits <= 0:
+        return
+    lo, hi = 0, 10**9
+    rng = os.environ.get("H3_ATTN_QK_LAYERS", "").strip()
+    if rng:
+        a, _, b = rng.partition("-")
+        lo, hi = int(a), int(b or a)
+    if not (lo <= layer_idx <= hi):
+        return
+    for name, t in (("q", q), ("k", k)):
+        before = t.float().norm()
+        _fake_quant_per_token(t, bits)
+        if (name, layer_idx) not in _QKLOG and os.environ.get("H3_ATTN_QK_LOG") == "1":
+            after = t.float().norm()
+            _QKLOG.add((name, layer_idx))
+            print(f"[QKINT8] L{layer_idx:02d} {name} bits={bits} "
+                  f"rel_err={((before-after)/before).item()*100:.3f}% "
+                  f"absmax={t.abs().max().item():.3f}", flush=True)
+    if os.environ.get("H3_ATTN_V_INT8", "0") == "1" and v is not None:
+        _fake_quant_per_token(v, bits)
+
 
 def maybe_capture_attention(layer_idx, q, k, v, block_size=128):
+    try:
+        _apply_qk_int8(layer_idx, q, k, v)
+    except Exception as _e:  # never let the experiment break generation
+        print(f"[QKINT8] disabled after error: {type(_e).__name__}: {_e}", flush=True)
     if os.environ.get("H3_CAPTURE_ATTN") != "1":
         return
     if layer_idx is None:
